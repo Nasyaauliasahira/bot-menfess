@@ -155,7 +155,7 @@ def check_cooldown(user_id: int) -> float:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Selamat datang di bot Menfess!\n\n"
-        f"Kirim pesan (teks atau foto+caption) diawali kata kunci "
+        f"Kirim pesan (teks, foto, lagu/audio, atau video+caption) diawali kata kunci "
         f"<b>{html.escape(TRIGGER_WORD)}</b> untuk memposting secara anonim ke channel.\n\n"
         f"⏳ Ada jeda {COOLDOWN_SECONDS} detik antar-pengiriman untuk mencegah spam.\n"
         "Ketik /help untuk bantuan lebih lanjut.",
@@ -166,8 +166,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📖 <b>Cara pakai:</b>\n"
-        f"1. Ketik pesanmu diawali <b>{html.escape(TRIGGER_WORD)}</b>\n"
-        "2. Kirim ke bot ini lewat chat pribadi\n"
+        f"1. Ketik pesanmu (atau caption foto/lagu/video) diawali <b>{html.escape(TRIGGER_WORD)}</b>\n"
+        "2. Kirim ke bot ini lewat chat pribadi (teks, foto, lagu/audio, atau video)\n"
         "3. Bot akan memposting pesanmu secara anonim ke channel\n\n"
         "Identitas kamu <b>tidak</b> ditampilkan di channel, tapi tetap tercatat "
         "di sistem untuk keperluan moderasi bila ada penyalahgunaan.",
@@ -267,6 +267,84 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await notify_admins(context, f"⚠️ Gagal posting foto menfess dari user {user.id}: {e}")
 
 
+async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message
+    caption = message.caption or ""
+    user = update.effective_user
+
+    if not caption.lower().startswith(TRIGGER_WORD):
+        await message.reply_text(
+            f'❌ Lagu ditolak. Caption harus diawali kata kunci "{TRIGGER_WORD}".'
+        )
+        return
+
+    remaining = check_cooldown(user.id)
+    if remaining > 0:
+        await message.reply_text(f"⏳ Tunggu {int(remaining)} detik lagi sebelum kirim menfess baru.")
+        return
+
+    body = strip_trigger(caption)
+    if len(body) > MAX_CAPTION_LEN:
+        await message.reply_text(f"❌ Caption terlalu panjang (maks {MAX_CAPTION_LEN} karakter).")
+        return
+
+    try:
+        file_id = message.audio.file_id
+        post_number = save_post(user.id, user.username or "", "audio", body)
+        await context.bot.send_audio(
+            chat_id=CHANNEL_ID,
+            audio=file_id,
+            caption=format_menfess(post_number, body),
+            parse_mode=ParseMode.HTML,
+        )
+        await message.reply_text(f"🚀 Menfess #{post_number} (lagu) berhasil terbit di channel!")
+    except Forbidden:
+        await message.reply_text("❌ Gagal posting: bot belum jadi admin di channel.")
+    except TelegramError as e:
+        logger.error("TelegramError saat posting lagu: %s", e)
+        await message.reply_text("❌ Gagal posting. Coba lagi nanti.")
+        await notify_admins(context, f"⚠️ Gagal posting lagu menfess dari user {user.id}: {e}")
+
+
+async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message
+    caption = message.caption or ""
+    user = update.effective_user
+
+    if not caption.lower().startswith(TRIGGER_WORD):
+        await message.reply_text(
+            f'❌ Video ditolak. Caption harus diawali kata kunci "{TRIGGER_WORD}".'
+        )
+        return
+
+    remaining = check_cooldown(user.id)
+    if remaining > 0:
+        await message.reply_text(f"⏳ Tunggu {int(remaining)} detik lagi sebelum kirim menfess baru.")
+        return
+
+    body = strip_trigger(caption)
+    if len(body) > MAX_CAPTION_LEN:
+        await message.reply_text(f"❌ Caption terlalu panjang (maks {MAX_CAPTION_LEN} karakter).")
+        return
+
+    try:
+        file_id = message.video.file_id
+        post_number = save_post(user.id, user.username or "", "video", body)
+        await context.bot.send_video(
+            chat_id=CHANNEL_ID,
+            video=file_id,
+            caption=format_menfess(post_number, body),
+            parse_mode=ParseMode.HTML,
+        )
+        await message.reply_text(f"🚀 Menfess #{post_number} (video) berhasil terbit di channel!")
+    except Forbidden:
+        await message.reply_text("❌ Gagal posting: bot belum jadi admin di channel.")
+    except TelegramError as e:
+        logger.error("TelegramError saat posting video: %s", e)
+        await message.reply_text("❌ Gagal posting. Coba lagi nanti.")
+        await notify_admins(context, f"⚠️ Gagal posting video menfess dari user {user.id}: {e}")
+
+
 async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("❓ Perintah tidak dikenali. Ketik /help untuk bantuan.")
 
@@ -287,6 +365,12 @@ def main() -> None:
     )
     app.add_handler(
         MessageHandler(filters.ChatType.PRIVATE & filters.PHOTO, handle_photo)
+    )
+    app.add_handler(
+        MessageHandler(filters.ChatType.PRIVATE & filters.AUDIO, handle_audio)
+    )
+    app.add_handler(
+        MessageHandler(filters.ChatType.PRIVATE & filters.VIDEO, handle_video)
     )
     app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
 
