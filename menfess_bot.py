@@ -16,6 +16,7 @@ Fitur:
 - Hanya bisa dipakai lewat chat pribadi (bukan grup)
 - BARU: Sistem approval sebelum posting (admin approve/reject via tombol)
 - BARU: Fitur balas menfess lain, format: "#fess to/123 isi balasan"
+- BARU: Tombol "↪️ Balas menfess ini" di tiap post channel (deep link, tanpa perlu ketik to/123 manual)
 """
 
 import html
@@ -333,19 +334,27 @@ def check_cooldown(user_id: int) -> float:
     return max(0.0, remaining)
 
 
+def reply_button(bot_username: str, post_number: int) -> InlineKeyboardMarkup:
+    """Tombol deep-link: klik -> buka chat pribadi bot, otomatis siap nerima balasan."""
+    url = f"https://t.me/{bot_username}?start=reply_{post_number}"
+    return InlineKeyboardMarkup([[InlineKeyboardButton("↪️ Balas menfess ini", url=url)]])
+
+
 async def publish_to_channel(
     context: ContextTypes.DEFAULT_TYPE, row, post_number: int
 ) -> None:
     text = format_menfess(post_number, row["message"] or "", row["reply_to"])
     content_type = row["content_type"]
+    bot_username = (await context.bot.get_me()).username
+    keyboard = reply_button(bot_username, post_number)
     if content_type == "text":
-        await context.bot.send_message(chat_id=CHANNEL_ID, text=text, parse_mode=ParseMode.HTML)
+        await context.bot.send_message(chat_id=CHANNEL_ID, text=text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
     elif content_type == "photo":
-        await context.bot.send_photo(chat_id=CHANNEL_ID, photo=row["file_id"], caption=text, parse_mode=ParseMode.HTML)
+        await context.bot.send_photo(chat_id=CHANNEL_ID, photo=row["file_id"], caption=text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
     elif content_type == "audio":
-        await context.bot.send_audio(chat_id=CHANNEL_ID, audio=row["file_id"], caption=text, parse_mode=ParseMode.HTML)
+        await context.bot.send_audio(chat_id=CHANNEL_ID, audio=row["file_id"], caption=text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
     elif content_type == "video":
-        await context.bot.send_video(chat_id=CHANNEL_ID, video=row["file_id"], caption=text, parse_mode=ParseMode.HTML)
+        await context.bot.send_video(chat_id=CHANNEL_ID, video=row["file_id"], caption=text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
 
 
 # ============================================================
@@ -359,6 +368,7 @@ async def submit_menfess(
     file_id: Optional[str],
     max_len: int,
     reject_label: str,
+    forced_reply_to: Optional[int] = None,
 ) -> None:
     message = update.message
     user = update.effective_user
@@ -368,7 +378,11 @@ async def submit_menfess(
         await message.reply_text(f"⏳ Tunggu {int(remaining)} detik lagi sebelum kirim menfess baru.")
         return
 
-    body, reply_to = parse_reply(raw_body)
+    if forced_reply_to is not None:
+        # Datang dari tombol "Balas menfess ini" -> seluruh pesan dianggap isi balasan
+        body, reply_to = raw_body, forced_reply_to
+    else:
+        body, reply_to = parse_reply(raw_body)
 
     if content_type == "text" and not body:
         await message.reply_text("❌ Isi menfess tidak boleh kosong.")
@@ -395,13 +409,38 @@ async def submit_menfess(
 # ============================================================
 # HANDLERS - perintah dasar
 # ============================================================
+START_REPLY_PATTERN = re.compile(r"^reply_(\d+)$")
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Deep link dari tombol "↪️ Balas menfess ini" di channel: /start reply_12
+    if context.args:
+        match = START_REPLY_PATTERN.match(context.args[0])
+        if match:
+            post_number = int(match.group(1))
+            if get_approved_post_by_number(post_number) is None:
+                await update.message.reply_text(
+                    f"❌ Menfess #{post_number} tidak ditemukan atau sudah tidak bisa dibalas."
+                )
+                return
+            context.user_data["pending_reply_to"] = post_number
+            await update.message.reply_text(
+                f"✍️ Oke, sekarang kirim balasan kamu untuk <b>Menfess #{post_number}</b>.\n"
+                "Boleh teks, foto, lagu/audio, atau video — langsung kirim aja, "
+                "tidak perlu ketik trigger atau to/ lagi.\n\n"
+                "Ketik /batal kalau berubah pikiran.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
     await update.message.reply_text(
         "👋 Selamat datang di bot Menfess!\n\n"
         f"Kirim pesan (teks, foto, lagu/audio, atau video+caption) diawali kata kunci "
         f"<b>{html.escape(TRIGGER_WORD)}</b> untuk mengirim menfess anonim.\n\n"
         "Menfess kamu akan ditinjau admin dulu sebelum tayang di channel.\n\n"
-        f"↪️ Mau balas menfess lain? Tambahkan <code>to/&lt;nomor&gt;</code> setelah trigger, contoh:\n"
+        f"↪️ Mau balas menfess lain? Paling gampang tinggal tekan tombol "
+        f"\"↪️ Balas menfess ini\" di postingan channel. Atau manual, tambahkan "
+        f"<code>to/&lt;nomor&gt;</code> setelah trigger, contoh:\n"
         f"<code>{html.escape(TRIGGER_WORD)} to/12 semangat ya!</code>\n\n"
         f"⏳ Ada jeda {COOLDOWN_SECONDS} detik antar-pengiriman untuk mencegah spam.\n"
         "Ketik /help untuk bantuan lebih lanjut.",
@@ -409,14 +448,24 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def cancel_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.user_data.pop("pending_reply_to", None) is not None:
+        await update.message.reply_text("👌 Oke, dibatalkan. Kamu bisa kirim menfess baru kapan saja.")
+    else:
+        await update.message.reply_text("Tidak ada balasan yang sedang menunggu untuk dibatalkan.")
+
+
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📖 <b>Cara pakai:</b>\n"
         f"1. Ketik pesanmu (atau caption foto/lagu/video) diawali <b>{html.escape(TRIGGER_WORD)}</b>\n"
-        "2. (Opsional) Mau balas menfess tertentu? Tambahkan <code>to/&lt;nomor&gt;</code> tepat setelah trigger,\n"
-        f"   contoh: <code>{html.escape(TRIGGER_WORD)} to/12 isi balasan</code>\n"
-        "3. Kirim ke bot ini lewat chat pribadi (teks, foto, lagu/audio, atau video)\n"
-        "4. Admin akan meninjau dulu sebelum menfess tayang di channel\n\n"
+        "2. Kirim ke bot ini lewat chat pribadi (teks, foto, lagu/audio, atau video)\n"
+        "3. Admin akan meninjau dulu sebelum menfess tayang di channel\n\n"
+        "↪️ <b>Mau balas menfess orang lain?</b> Ada 2 cara:\n"
+        "• Paling gampang: tekan tombol \"↪️ Balas menfess ini\" di postingan channel, "
+        "lalu langsung kirim balasanmu (tanpa trigger/to/ lagi). Batalkan dengan /batal.\n"
+        f"• Manual: tambahkan <code>to/&lt;nomor&gt;</code> setelah trigger, contoh:\n"
+        f"  <code>{html.escape(TRIGGER_WORD)} to/12 isi balasan</code>\n\n"
         "Identitas kamu <b>tidak</b> ditampilkan di channel, tapi tetap tercatat "
         "di sistem untuk keperluan moderasi bila ada penyalahgunaan.",
         parse_mode=ParseMode.HTML,
@@ -440,6 +489,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     text = message.text or ""
 
+    pending_reply_to = context.user_data.pop("pending_reply_to", None)
+    if pending_reply_to is not None:
+        await submit_menfess(
+            update, context, "text", text.strip(), None, MAX_TEXT_LEN, "Pesan",
+            forced_reply_to=pending_reply_to,
+        )
+        return
+
     if not text.lower().startswith(TRIGGER_WORD):
         await message.reply_text(
             f'❌ Pesan ditolak. Harus diawali kata kunci "{TRIGGER_WORD}".'
@@ -453,6 +510,15 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     caption = message.caption or ""
+    file_id = message.photo[-1].file_id
+
+    pending_reply_to = context.user_data.pop("pending_reply_to", None)
+    if pending_reply_to is not None:
+        await submit_menfess(
+            update, context, "photo", caption.strip(), file_id, MAX_CAPTION_LEN, "Caption",
+            forced_reply_to=pending_reply_to,
+        )
+        return
 
     if not caption.lower().startswith(TRIGGER_WORD):
         await message.reply_text(
@@ -461,13 +527,21 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     raw_body = strip_trigger(caption)
-    file_id = message.photo[-1].file_id
     await submit_menfess(update, context, "photo", raw_body, file_id, MAX_CAPTION_LEN, "Caption")
 
 
 async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     caption = message.caption or ""
+    file_id = message.audio.file_id
+
+    pending_reply_to = context.user_data.pop("pending_reply_to", None)
+    if pending_reply_to is not None:
+        await submit_menfess(
+            update, context, "audio", caption.strip(), file_id, MAX_CAPTION_LEN, "Caption",
+            forced_reply_to=pending_reply_to,
+        )
+        return
 
     if not caption.lower().startswith(TRIGGER_WORD):
         await message.reply_text(
@@ -476,13 +550,21 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     raw_body = strip_trigger(caption)
-    file_id = message.audio.file_id
     await submit_menfess(update, context, "audio", raw_body, file_id, MAX_CAPTION_LEN, "Caption")
 
 
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     caption = message.caption or ""
+    file_id = message.video.file_id
+
+    pending_reply_to = context.user_data.pop("pending_reply_to", None)
+    if pending_reply_to is not None:
+        await submit_menfess(
+            update, context, "video", caption.strip(), file_id, MAX_CAPTION_LEN, "Caption",
+            forced_reply_to=pending_reply_to,
+        )
+        return
 
     if not caption.lower().startswith(TRIGGER_WORD):
         await message.reply_text(
@@ -491,7 +573,6 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     raw_body = strip_trigger(caption)
-    file_id = message.video.file_id
     await submit_menfess(update, context, "video", raw_body, file_id, MAX_CAPTION_LEN, "Caption")
 
 
@@ -594,6 +675,7 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("stats", stats_command))
+    app.add_handler(CommandHandler("batal", cancel_reply))
     app.add_handler(
         MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, handle_text)
     )
