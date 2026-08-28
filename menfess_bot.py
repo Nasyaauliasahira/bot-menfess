@@ -97,6 +97,8 @@ def init_db() -> None:
         existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(posts)")}
         if "category" not in existing_cols:
             conn.execute("ALTER TABLE posts ADD COLUMN category TEXT")
+        if "telegram_message_id" not in existing_cols:
+            conn.execute("ALTER TABLE posts ADD COLUMN telegram_message_id INTEGER")
         conn.commit()
 
 
@@ -133,6 +135,29 @@ def get_stats() -> Tuple[int, int]:
             "SELECT COUNT(*) FROM posts WHERE created_at LIKE ?", (f"{today}%",)
         ).fetchone()[0]
     return total, today_count
+
+
+def set_telegram_message_id(post_number: int, telegram_message_id: int) -> None:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "UPDATE posts SET telegram_message_id = ? WHERE id = ?",
+            (telegram_message_id, post_number),
+        )
+        conn.commit()
+
+
+def get_post(post_number: int) -> Optional[Tuple[int, Optional[int]]]:
+    with sqlite3.connect(DB_PATH) as conn:
+        return conn.execute(
+            "SELECT id, telegram_message_id FROM posts WHERE id = ?",
+            (post_number,),
+        ).fetchone()
+
+
+def delete_post_record(post_number: int) -> None:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("DELETE FROM posts WHERE id = ?", (post_number,))
+        conn.commit()
 
 
 # ============================================================
@@ -267,6 +292,48 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def delete_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ Perintah ini khusus admin.")
+        return
+
+    if len(context.args) != 1 or not context.args[0].isdigit():
+        await update.message.reply_text("Format: /hapus <nomor menfess>")
+        return
+
+    post_number = int(context.args[0])
+    post = get_post(post_number)
+    if post is None:
+        await update.message.reply_text(f"❌ Menfess #{post_number} tidak ditemukan.")
+        return
+
+    _post_id, telegram_message_id = post
+    if telegram_message_id is None:
+        await update.message.reply_text(
+            f"❌ Menfess #{post_number} belum punya ID pesan Telegram. "
+            "Posting lama sebelum fitur hapus tidak bisa dihapus otomatis."
+        )
+        return
+
+    try:
+        await context.bot.delete_message(CHANNEL_ID, telegram_message_id)
+    except Forbidden:
+        await update.message.reply_text(
+            "❌ Bot tidak punya izin menghapus pesan di channel. Jadikan bot admin "
+            "dengan izin menghapus pesan."
+        )
+        return
+    except BadRequest as error:
+        logger.error("Gagal menghapus menfess #%s: %s", post_number, error)
+        await update.message.reply_text(
+            "❌ Pesan channel tidak ditemukan atau sudah terhapus. Data lokal tetap disimpan."
+        )
+        return
+
+    delete_post_record(post_number)
+    await update.message.reply_text(f"✅ Menfess #{post_number} berhasil dihapus.")
+
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     text = message.text or ""
@@ -296,11 +363,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         post_number = save_post(user.id, user.username or "", "text", body, category_key)
-        await context.bot.send_message(
+        sent_message = await context.bot.send_message(
             chat_id=CHANNEL_ID,
             text=format_menfess(post_number, body, hashtag),
             parse_mode=ParseMode.HTML,
         )
+        set_telegram_message_id(post_number, sent_message.message_id)
         clear_session(context)
         await message.reply_text(
             f"🚀 Menfess #{post_number} ({label}) berhasil terbit di channel!"
@@ -343,12 +411,13 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         file_id = message.photo[-1].file_id
         post_number = save_post(user.id, user.username or "", "photo", body, category_key)
-        await context.bot.send_photo(
+        sent_message = await context.bot.send_photo(
             chat_id=CHANNEL_ID,
             photo=file_id,
             caption=format_menfess(post_number, body, hashtag),
             parse_mode=ParseMode.HTML,
         )
+        set_telegram_message_id(post_number, sent_message.message_id)
         clear_session(context)
         await message.reply_text(
             f"🚀 Menfess #{post_number} (foto - {label}) berhasil terbit di channel!"
@@ -388,12 +457,13 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         file_id = message.audio.file_id
         post_number = save_post(user.id, user.username or "", "audio", body, category_key)
-        await context.bot.send_audio(
+        sent_message = await context.bot.send_audio(
             chat_id=CHANNEL_ID,
             audio=file_id,
             caption=format_menfess(post_number, body, hashtag),
             parse_mode=ParseMode.HTML,
         )
+        set_telegram_message_id(post_number, sent_message.message_id)
         clear_session(context)
         await message.reply_text(
             f"🚀 Menfess #{post_number} (lagu - {label}) berhasil terbit di channel!"
@@ -433,12 +503,13 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         file_id = message.video.file_id
         post_number = save_post(user.id, user.username or "", "video", body, category_key)
-        await context.bot.send_video(
+        sent_message = await context.bot.send_video(
             chat_id=CHANNEL_ID,
             video=file_id,
             caption=format_menfess(post_number, body, hashtag),
             parse_mode=ParseMode.HTML,
         )
+        set_telegram_message_id(post_number, sent_message.message_id)
         clear_session(context)
         await message.reply_text(
             f"🚀 Menfess #{post_number} (video - {label}) berhasil terbit di channel!"
@@ -466,6 +537,7 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("stats", stats_command))
+    app.add_handler(CommandHandler("hapus", delete_command))
     app.add_handler(CallbackQueryHandler(category_selected, pattern=r"^cat_"))
     app.add_handler(CallbackQueryHandler(cancel_selected, pattern=r"^cancel$"))
     app.add_handler(
