@@ -18,6 +18,7 @@ Fitur:
 import html
 import logging
 import os
+import random
 import sqlite3
 import time
 from datetime import datetime
@@ -53,6 +54,8 @@ CATEGORIES = {
     "ask": ("Ask", "#Ask"),
     "findpartner": ("Find Partner", "#FindPartner"),
 }
+RANDOM_CATEGORY_KEY = "random"
+RANDOM_CATEGORY_LABEL = "Random"
 
 ADMIN_IDS = {
     int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()
@@ -168,10 +171,18 @@ def strip_trigger(text: str) -> str:
     return text[len(TRIGGER_WORD):].strip()
 
 
-def format_menfess(post_number: int, body: str, hashtag: str = "") -> str:
+def format_menfess(post_number: int, body: str, hashtag: str = "", category_label: str = "") -> str:
     safe_body = html.escape(body) if body else "<i>(tanpa teks)</i>"
-    tag_part = f" {hashtag}" if hashtag else ""
-    return f"💌 <b>Menfess #{post_number}</b>{tag_part}\n\n{safe_body}"
+    tag_part = f"<b>{html.escape(hashtag)}</b> " if hashtag else ""
+    label = html.escape(category_label).strip()
+    time_text = datetime.now().strftime("%H:%M")
+
+    header = "<b>Hari Ini</b>"
+    title = f"💌 <b>Menfess #{post_number}</b>"
+    category_line = f"<i>{label}</i>\n" if label else ""
+    footer = f"\n\n<i>{time_text}</i>"
+
+    return f"{header}\n\n{title}\n{category_line}{tag_part}{safe_body}{footer}"
 
 
 async def notify_admins(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
@@ -192,12 +203,18 @@ def check_cooldown(user_id: int) -> float:
     return max(0.0, remaining)
 
 
+def get_random_category_key() -> str:
+    """Pilih kategori secara acak dari kategori yang tersedia."""
+    return random.choice(list(CATEGORIES.keys()))
+
+
 def build_category_keyboard() -> InlineKeyboardMarkup:
-    """Tombol pilihan kategori, 2 per baris."""
+    """Tombol pilihan kategori, 2 per baris, plus opsi random."""
     buttons = [
         InlineKeyboardButton(label, callback_data=f"cat_{key}")
         for key, (label, _hashtag) in CATEGORIES.items()
     ]
+    buttons.append(InlineKeyboardButton("🎲 Random", callback_data=f"cat_{RANDOM_CATEGORY_KEY}"))
     rows = [buttons[i : i + 2] for i in range(0, len(buttons), 2)]
     return InlineKeyboardMarkup(rows)
 
@@ -238,7 +255,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     category_list = "\n".join(f"• {label}" for label, _ in CATEGORIES.values())
     await update.message.reply_text(
         "📖 <b>Cara pakai:</b>\n"
-        "1. Ketik /start, lalu pilih salah satu kategori:\n"
+        "1. Ketik /start, lalu pilih salah satu kategori atau tombol 🎲 Random:\n"
         f"{html.escape(category_list)}\n"
         "2. Kirim isi menfess-mu (teks, foto, lagu/audio, atau video) — langsung saja, "
         "tanpa hashtag atau keyword apa pun.\n"
@@ -256,6 +273,20 @@ async def category_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     key = query.data[len("cat_") :]
+
+    if key == RANDOM_CATEGORY_KEY:
+        key = get_random_category_key()
+        chosen_label = CATEGORIES[key][0]
+        context.user_data["category"] = key
+        await query.edit_message_text(
+            f"✅ Kategori acak dipilih: <b>{html.escape(chosen_label)}</b>\n\n"
+            "Sekarang kirim isi menfess-mu (teks, foto, lagu/audio, atau video). "
+            "Tidak perlu pakai hashtag, langsung kirim saja.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=build_cancel_keyboard(),
+        )
+        return
+
     if key not in CATEGORIES:
         await query.edit_message_text("❌ Kategori tidak dikenali, coba /start lagi.")
         return
@@ -365,7 +396,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         post_number = save_post(user.id, user.username or "", "text", body, category_key)
         sent_message = await context.bot.send_message(
             chat_id=CHANNEL_ID,
-            text=format_menfess(post_number, body, hashtag),
+            text=format_menfess(post_number, body, hashtag, label),
             parse_mode=ParseMode.HTML,
         )
         set_telegram_message_id(post_number, sent_message.message_id)
@@ -414,7 +445,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sent_message = await context.bot.send_photo(
             chat_id=CHANNEL_ID,
             photo=file_id,
-            caption=format_menfess(post_number, body, hashtag),
+            caption=format_menfess(post_number, body, hashtag, label),
             parse_mode=ParseMode.HTML,
         )
         set_telegram_message_id(post_number, sent_message.message_id)
@@ -460,7 +491,7 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sent_message = await context.bot.send_audio(
             chat_id=CHANNEL_ID,
             audio=file_id,
-            caption=format_menfess(post_number, body, hashtag),
+            caption=format_menfess(post_number, body, hashtag, label),
             parse_mode=ParseMode.HTML,
         )
         set_telegram_message_id(post_number, sent_message.message_id)
@@ -506,7 +537,7 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sent_message = await context.bot.send_video(
             chat_id=CHANNEL_ID,
             video=file_id,
-            caption=format_menfess(post_number, body, hashtag),
+            caption=format_menfess(post_number, body, hashtag, label),
             parse_mode=ParseMode.HTML,
         )
         set_telegram_message_id(post_number, sent_message.message_id)
