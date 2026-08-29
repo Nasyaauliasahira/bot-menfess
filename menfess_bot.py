@@ -16,6 +16,12 @@ Fitur:
 - Pengaturan runtime (cooldown, batas panjang teks/caption) yang HANYA bisa
   diubah oleh admin lewat perintah /pengaturan, tersimpan di database
   sehingga tidak perlu edit .env atau restart bot.
+- Mendukung kirim BANYAK foto/video sekaligus (album/media group) dalam satu
+  menfess, otomatis digabung jadi satu post di channel.
+
+CATATAN INSTALASI:
+Fitur album butuh job-queue dari python-telegram-bot, pasang dengan:
+    pip install "python-telegram-bot[job-queue]"
 """
 
 import html
@@ -27,7 +33,7 @@ from datetime import datetime
 from typing import Optional, Tuple
 
 from dotenv import load_dotenv
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, InputMediaVideo, Update
 from telegram.constants import ParseMode
 from telegram.error import BadRequest, Forbidden, TelegramError
 from telegram.ext import (
@@ -62,6 +68,12 @@ ADMIN_IDS = {
     int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()
 }
 DB_PATH = os.getenv("DB_PATH", "menfess.db")
+
+# Batas Telegram: maksimal 10 item per album (media group).
+MAX_MEDIA_GROUP_ITEMS = 10
+# Jeda tunggu (detik) setelah item terakhir album diterima sebelum diposting,
+# supaya semua foto/video dalam satu album sempat terkumpul dulu.
+MEDIA_GROUP_DEBOUNCE_SECONDS = 1.5
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN belum diset. Isi di file .env atau environment variable.")
@@ -319,6 +331,138 @@ def clear_session(context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data.pop("category", None)
 
 
+# ------------------------------------------------------------
+# ALBUM / MEDIA GROUP (kirim banyak foto & video sekaligus)
+# ------------------------------------------------------------
+# Telegram mengirim tiap foto/video dalam satu album sebagai UPDATE TERPISAH,
+# tapi semuanya berbagi message.media_group_id yang sama. Jadi kita tampung
+# dulu item-itemnya di buffer, tunggu sebentar (debounce) sampai tidak ada
+# item baru masuk, baru diposting sekaligus sebagai satu album ke channel.
+def get_media_group_buffer(context: ContextTypes.DEFAULT_TYPE) -> dict:
+    return context.application.bot_data.setdefault("media_groups", {})
+
+
+async def handle_media_group_item(update: Update, context: ContextTypes.DEFAULT_TYPE, kind: str) -> None:
+    message = update.message
+    group_id = message.media_group_id
+    user = update.effective_user
+
+    buffers = get_media_group_buffer(context)
+    entry = buffers.get(group_id)
+    if entry is None:
+        entry = {
+            "items": [],
+            "caption": None,
+            "user_id": user.id,
+            "username": user.username or "",
+            "category_key": get_session_category(context),
+            "chat_id": message.chat_id,
+            "job": None,
+        }
+        buffers[group_id] = entry
+
+    # Caption album di Telegram biasanya cuma nempel di salah satu item saja
+    # (urutan kedatangan tidak dijamin), jadi kita tangkap begitu ketemu.
+    if message.caption:
+        entry["caption"] = message.caption.strip()
+
+    if len(entry["items"]) < MAX_MEDIA_GROUP_ITEMS:
+        if kind == "photo":
+            entry["items"].append(("photo", message.photo[-1].file_id))
+        else:
+            entry["items"].append(("video", message.video.file_id))
+
+    # Reset timer debounce tiap kali ada item baru masuk untuk grup ini.
+    if entry["job"] is not None:
+        entry["job"].schedule_removal()
+    entry["job"] = context.job_queue.run_once(
+        process_media_group,
+        MEDIA_GROUP_DEBOUNCE_SECONDS,
+        data=group_id,
+        name=f"media_group_{group_id}",
+    )
+
+
+async def process_media_group(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Dipanggil otomatis oleh job_queue setelah semua item album selesai terkumpul."""
+    group_id = context.job.data
+    buffers = context.application.bot_data.get("media_groups", {})
+    entry = buffers.pop(group_id, None)
+    if entry is None or not entry["items"]:
+        return
+
+    user_id = entry["user_id"]
+    chat_id = entry["chat_id"]
+    category_key = entry["category_key"]
+
+    if category_key is None:
+        await context.bot.send_message(
+            chat_id, "❌ Kamu belum pilih kategori. Ketik /start dulu dan pilih kategorinya ya."
+        )
+        return
+
+    remaining = check_cooldown(user_id)
+    if remaining > 0:
+        await context.bot.send_message(
+            chat_id, f"⏳ Tunggu {int(remaining)} detik lagi sebelum kirim menfess baru."
+        )
+        return
+
+    body = (entry["caption"] or "").strip()
+    max_caption_len = get_setting("max_caption_len")
+    if len(body) > max_caption_len:
+        await context.bot.send_message(
+            chat_id, f"❌ Caption terlalu panjang (maks {max_caption_len} karakter)."
+        )
+        return
+
+    label, hashtag = CATEGORIES[category_key]
+
+    try:
+        post_number = save_post(user_id, entry["username"], "album", body, category_key)
+        caption_html = format_menfess(post_number, body, hashtag)
+
+        media_list = []
+        for index, (kind, file_id) in enumerate(entry["items"]):
+            # Caption cuma dipasang di item pertama, sisanya polos (perilaku
+            # standar album Telegram: caption tampil di bawah item pertama).
+            is_first = index == 0
+            if kind == "photo":
+                media_list.append(
+                    InputMediaPhoto(
+                        file_id,
+                        caption=caption_html if is_first else None,
+                        parse_mode=ParseMode.HTML if is_first else None,
+                    )
+                )
+            else:
+                media_list.append(
+                    InputMediaVideo(
+                        file_id,
+                        caption=caption_html if is_first else None,
+                        parse_mode=ParseMode.HTML if is_first else None,
+                    )
+                )
+
+        sent_messages = await context.bot.send_media_group(chat_id=CHANNEL_ID, media=media_list)
+        set_telegram_message_id(post_number, sent_messages[0].message_id)
+
+        # Reset kategori milik user yang bersangkutan (bukan user_data lokal job ini).
+        context.application.user_data[user_id].pop("category", None)
+
+        await context.bot.send_message(
+            chat_id,
+            f"🚀 Menfess #{post_number} (album {len(media_list)} item - {label}) "
+            "berhasil terbit di channel!",
+        )
+    except Forbidden:
+        await context.bot.send_message(chat_id, "❌ Gagal posting: bot belum jadi admin di channel.")
+    except TelegramError as e:
+        logger.error("TelegramError saat posting album: %s", e)
+        await context.bot.send_message(chat_id, "❌ Gagal posting. Coba lagi nanti.")
+        await notify_admins(context, f"⚠️ Gagal posting album menfess dari user {user_id}: {e}")
+
+
 # ============================================================
 # HANDLERS
 # ============================================================
@@ -561,6 +705,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
+
+    # Kalau ini bagian dari album (kirim banyak foto/video sekaligus),
+    # tampung dulu lewat buffer, jangan diproses satu-satu.
+    if message.media_group_id is not None:
+        await handle_media_group_item(update, context, "photo")
+        return
+
     caption = message.caption or ""
     user = update.effective_user
 
@@ -655,6 +806,13 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
+
+    # Kalau ini bagian dari album (kirim banyak foto/video sekaligus),
+    # tampung dulu lewat buffer, jangan diproses satu-satu.
+    if message.media_group_id is not None:
+        await handle_media_group_item(update, context, "video")
+        return
+
     caption = message.caption or ""
     user = update.effective_user
 
