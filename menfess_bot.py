@@ -52,6 +52,7 @@ CATEGORIES = {
     "spill": ("Spill", "#Spill"),
     "ask": ("Ask", "#Ask"),
     "findpartner": ("Find Partner", "#FindPartner"),
+    "random": ("Random", "#Random"),
 }
 
 ADMIN_IDS = {
