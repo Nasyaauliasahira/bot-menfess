@@ -13,6 +13,9 @@ Fitur:
 - Perintah /stats khusus admin
 - Error yang lebih informatif + notifikasi ke admin bila gagal posting
 - Hanya bisa dipakai lewat chat pribadi (bukan grup)
+- Pengaturan runtime (cooldown, batas panjang teks/caption) yang HANYA bisa
+  diubah oleh admin lewat perintah /pengaturan, tersimpan di database
+  sehingga tidak perlu edit .env atau restart bot.
 """
 
 import html
@@ -58,9 +61,6 @@ CATEGORIES = {
 ADMIN_IDS = {
     int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()
 }
-COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "60"))
-MAX_TEXT_LEN = 4000       # batas aman pesan teks Telegram (limit asli 4096)
-MAX_CAPTION_LEN = 1000    # batas aman caption foto (limit asli 1024)
 DB_PATH = os.getenv("DB_PATH", "menfess.db")
 
 if not BOT_TOKEN:
@@ -75,6 +75,94 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger("menfess_bot")
+
+
+# ============================================================
+# PENGATURAN RUNTIME (hanya admin yang boleh mengubah)
+# ============================================================
+# Definisi tiap setting: key -> (label buat ditampilkan, tipe data, nilai default,
+# batas minimum, batas maksimum). Nilai batas dipakai buat validasi input admin
+# supaya nggak salah masukin angka aneh (misal cooldown negatif).
+SETTINGS_META = {
+    "cooldown_seconds": {
+        "label": "Cooldown antar-kiriman (detik)",
+        "type": int,
+        "default": 60,
+        "min": 0,
+        "max": 3600,
+    },
+    "max_text_len": {
+        "label": "Batas panjang teks menfess",
+        "type": int,
+        "default": 4000,
+        "min": 50,
+        "max": 4096,
+    },
+    "max_caption_len": {
+        "label": "Batas panjang caption (foto/audio/video)",
+        "type": int,
+        "default": 1000,
+        "min": 20,
+        "max": 1024,
+    },
+}
+
+
+def init_settings_db(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+        """
+    )
+    # Isi nilai default kalau belum ada di DB, jangan overwrite yang sudah diubah admin.
+    for key, meta in SETTINGS_META.items():
+        conn.execute(
+            "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
+            (key, str(meta["default"])),
+        )
+    conn.commit()
+
+
+def get_setting(key: str):
+    meta = SETTINGS_META[key]
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+    if row is None:
+        return meta["default"]
+    try:
+        return meta["type"](row[0])
+    except (TypeError, ValueError):
+        return meta["default"]
+
+
+def set_setting(key: str, raw_value: str) -> Tuple[bool, str]:
+    """Validasi & simpan nilai setting baru. Return (berhasil, pesan)."""
+    meta = SETTINGS_META[key]
+    try:
+        value = meta["type"](raw_value)
+    except (TypeError, ValueError):
+        return False, f"❌ Nilai harus berupa angka ({meta['label']})."
+
+    if "min" in meta and value < meta["min"]:
+        return False, f"❌ Nilai minimal untuk {meta['label']} adalah {meta['min']}."
+    if "max" in meta and value > meta["max"]:
+        return False, f"❌ Nilai maksimal untuk {meta['label']} adalah {meta['max']}."
+
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, str(value)),
+        )
+        conn.commit()
+    return True, f"✅ {meta['label']} berhasil diubah jadi {value}."
+
+
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
 
 
 # ============================================================
@@ -101,6 +189,7 @@ def init_db() -> None:
         if "telegram_message_id" not in existing_cols:
             conn.execute("ALTER TABLE posts ADD COLUMN telegram_message_id INTEGER")
         conn.commit()
+        init_settings_db(conn)
 
 
 def get_last_post_time(user_id: int) -> Optional[float]:
@@ -189,7 +278,7 @@ def check_cooldown(user_id: int) -> float:
     if last_time is None:
         return 0
     elapsed = time.time() - last_time
-    remaining = COOLDOWN_SECONDS - elapsed
+    remaining = get_setting("cooldown_seconds") - elapsed
     return max(0.0, remaining)
 
 
@@ -207,6 +296,17 @@ def build_cancel_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [[InlineKeyboardButton("❌ Batal", callback_data="cancel")]]
     )
+
+
+def build_settings_keyboard() -> InlineKeyboardMarkup:
+    """Tombol daftar pengaturan yang bisa diubah admin, isi tombolnya menampilkan nilai saat ini."""
+    rows = []
+    for key, meta in SETTINGS_META.items():
+        current = get_setting(key)
+        rows.append(
+            [InlineKeyboardButton(f"{meta['label']}: {current}", callback_data=f"setting_{key}")]
+        )
+    return InlineKeyboardMarkup(rows)
 
 
 def get_session_category(context: ContextTypes.DEFAULT_TYPE) -> Optional[str]:
@@ -228,7 +328,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👋 Selamat datang di bot Menfess!\n\n"
         "Pilih dulu kategori menfess-mu di bawah ini, lalu kirim isi pesannya "
         "(teks, foto, lagu/audio, atau video) — tanpa perlu ketik hashtag apa pun.\n\n"
-        f"⏳ Ada jeda {COOLDOWN_SECONDS} detik antar-pengiriman untuk mencegah spam.\n"
+        f"⏳ Ada jeda {get_setting('cooldown_seconds')} detik antar-pengiriman untuk mencegah spam.\n"
         "Ketik /help untuk bantuan lebih lanjut.",
         parse_mode=ParseMode.HTML,
         reply_markup=build_category_keyboard(),
@@ -237,7 +337,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     category_list = "\n".join(f"• {label}" for label, _ in CATEGORIES.values())
-    await update.message.reply_text(
+    text = (
         "📖 <b>Cara pakai:</b>\n"
         "1. Ketik /start, lalu pilih salah satu kategori:\n"
         f"{html.escape(category_list)}\n"
@@ -246,9 +346,16 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "3. Bot otomatis menambahkan hashtag kategori dan memposting secara anonim ke channel.\n"
         "4. Sedang di tengah proses dan berubah pikiran? Tekan tombol ❌ Batal.\n\n"
         "Identitas kamu <b>tidak</b> ditampilkan di channel, tapi tetap tercatat "
-        "di sistem untuk keperluan moderasi bila ada penyalahgunaan.",
-        parse_mode=ParseMode.HTML,
+        "di sistem untuk keperluan moderasi bila ada penyalahgunaan."
     )
+    if is_admin(update.effective_user.id):
+        text += (
+            "\n\n🛠 <b>Khusus admin:</b>\n"
+            "• /stats — lihat statistik menfess\n"
+            "• /hapus &lt;nomor&gt; — hapus menfess dari channel\n"
+            "• /pengaturan — ubah cooldown & batas panjang pesan"
+        )
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
 
 async def category_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -284,7 +391,7 @@ async def cancel_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS:
+    if not is_admin(update.effective_user.id):
         await update.message.reply_text("⛔ Perintah ini khusus admin.")
         return
     total, today_count = get_stats()
@@ -294,7 +401,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def delete_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS:
+    if not is_admin(update.effective_user.id):
         await update.message.reply_text("⛔ Perintah ini khusus admin.")
         return
 
@@ -335,10 +442,76 @@ async def delete_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Menfess #{post_number} berhasil dihapus.")
 
 
+# ------------------------------------------------------------
+# PENGATURAN (admin only)
+# ------------------------------------------------------------
+async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ Perintah ini khusus admin.")
+        return
+    context.user_data.pop("editing_setting", None)
+    await update.message.reply_text(
+        "⚙️ <b>Pengaturan Bot</b>\n\n"
+        "Pilih pengaturan yang mau kamu ubah. Nilai saat ini ditampilkan di tombol.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=build_settings_keyboard(),
+    )
+
+
+async def settings_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+
+    # Cek admin di level callback juga — jangan cuma andalkan command handler,
+    # supaya orang lain nggak bisa "warisin" tombol admin dari chat lama.
+    if not is_admin(query.from_user.id):
+        await query.answer("⛔ Khusus admin.", show_alert=True)
+        return
+
+    await query.answer()
+    key = query.data[len("setting_") :]
+    if key not in SETTINGS_META:
+        await query.edit_message_text("❌ Pengaturan tidak dikenali.")
+        return
+
+    meta = SETTINGS_META[key]
+    context.user_data["editing_setting"] = key
+    await query.edit_message_text(
+        f"✏️ Ubah <b>{html.escape(meta['label'])}</b>\n"
+        f"Nilai saat ini: <code>{get_setting(key)}</code>\n"
+        f"Rentang valid: {meta['min']} – {meta['max']}\n\n"
+        "Kirim angka baru sebagai pesan biasa, atau ketik /batalpengaturan untuk membatalkan.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def cancel_setting_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ Perintah ini khusus admin.")
+        return
+    if context.user_data.pop("editing_setting", None) is not None:
+        await update.message.reply_text("🚫 Perubahan pengaturan dibatalkan.")
+    else:
+        await update.message.reply_text("Tidak ada pengaturan yang sedang diubah.")
+
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     text = message.text or ""
     user = update.effective_user
+
+    # --- Jalur khusus admin: sedang mengisi nilai pengaturan baru ---
+    editing_key = context.user_data.get("editing_setting")
+    if editing_key is not None:
+        if not is_admin(user.id):
+            # Seharusnya nggak mungkin kejadian (flag ini cuma diset lewat menu admin),
+            # tapi dijaga tetap aman kalau ada state nyasar.
+            context.user_data.pop("editing_setting", None)
+        else:
+            ok, msg = set_setting(editing_key, text.strip())
+            if ok:
+                context.user_data.pop("editing_setting", None)
+            await message.reply_text(msg)
+            return
 
     category_key = get_session_category(context)
     if category_key is None:
@@ -356,8 +529,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not body:
         await message.reply_text("❌ Isi menfess tidak boleh kosong.")
         return
-    if len(body) > MAX_TEXT_LEN:
-        await message.reply_text(f"❌ Pesan terlalu panjang (maks {MAX_TEXT_LEN} karakter).")
+    max_text_len = get_setting("max_text_len")
+    if len(body) > max_text_len:
+        await message.reply_text(f"❌ Pesan terlalu panjang (maks {max_text_len} karakter).")
         return
 
     label, hashtag = CATEGORIES[category_key]
@@ -403,8 +577,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     body = caption.strip()
-    if len(body) > MAX_CAPTION_LEN:
-        await message.reply_text(f"❌ Caption terlalu panjang (maks {MAX_CAPTION_LEN} karakter).")
+    max_caption_len = get_setting("max_caption_len")
+    if len(body) > max_caption_len:
+        await message.reply_text(f"❌ Caption terlalu panjang (maks {max_caption_len} karakter).")
         return
 
     label, hashtag = CATEGORIES[category_key]
@@ -449,8 +624,9 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     body = caption.strip()
-    if len(body) > MAX_CAPTION_LEN:
-        await message.reply_text(f"❌ Caption terlalu panjang (maks {MAX_CAPTION_LEN} karakter).")
+    max_caption_len = get_setting("max_caption_len")
+    if len(body) > max_caption_len:
+        await message.reply_text(f"❌ Caption terlalu panjang (maks {max_caption_len} karakter).")
         return
 
     label, hashtag = CATEGORIES[category_key]
@@ -495,8 +671,9 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     body = caption.strip()
-    if len(body) > MAX_CAPTION_LEN:
-        await message.reply_text(f"❌ Caption terlalu panjang (maks {MAX_CAPTION_LEN} karakter).")
+    max_caption_len = get_setting("max_caption_len")
+    if len(body) > max_caption_len:
+        await message.reply_text(f"❌ Caption terlalu panjang (maks {max_caption_len} karakter).")
         return
 
     label, hashtag = CATEGORIES[category_key]
@@ -539,8 +716,11 @@ def main() -> None:
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(CommandHandler("hapus", delete_command))
+    app.add_handler(CommandHandler("pengaturan", settings_command))
+    app.add_handler(CommandHandler("batalpengaturan", cancel_setting_command))
     app.add_handler(CallbackQueryHandler(category_selected, pattern=r"^cat_"))
     app.add_handler(CallbackQueryHandler(cancel_selected, pattern=r"^cancel$"))
+    app.add_handler(CallbackQueryHandler(settings_menu_callback, pattern=r"^setting_"))
     app.add_handler(
         MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, handle_text)
     )
